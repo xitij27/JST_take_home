@@ -197,7 +197,7 @@ class BackstopMarketMaker:
                 cancel_result = self.cancel_existing_orders()
                 cancel_end_time = time.time()
                 cancel_latency = cancel_end_time - cancel_start_time
-                print(f"   Cancel result: {cancel_result[0]['orderID']}")
+                print(f"   Cancel result: {[order['orderID'] for order in cancel_result]}")
                 print(f"   Latency for cancelling existing orders: {cancel_latency:.4f} seconds")
 
                 # Measure latency for placing new orders

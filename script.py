@@ -1,90 +1,344 @@
+import aiohttp
+import asyncio
 import time
-from bitmex import bitmex
-from datetime import datetime
+import datetime
+import hashlib
+import hmac
+import json
+import urllib.parse
+import threading
+import websocket
+import signal
+import sys
+import logging
+import KEYS
 
-# BitMEX production API details (Pricing Source)
-BITMEX_PROD_API_KEY = "your_production_api_key"
-BITMEX_PROD_API_SECRET = "your_production_api_secret"
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] [%(threadName)s] %(message)s",
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger(__name__)
 
-# BitMEX Testnet API details (Target Venue)
-BITMEX_TESTNET_API_KEY = "your_testnet_api_key"
-BITMEX_TESTNET_API_SECRET = "your_testnet_api_secret"
+class APIKeyAuthenticator:
+    """
+    Handles API key authentication for requests.
 
-# Cost constants
-COST_TO_BUY = 0.005  # 50 basis points
-COST_TO_SELL = 0.0075  # 75 basis points
+    Attributes:
+        host (str): The base URL for the API.
+        api_key (str): The API key.
+        api_secret (str): The API secret key.
+    """
+    def __init__(self, host, api_key, api_secret):
+        self.host = host
+        self.api_key = api_key
+        self.api_secret = api_secret
 
-# Repricing interval in seconds
-REPRICE_INTERVAL = 60  # 1 minute
+    def generate_signature(self, secret, verb, url, expires, data):
+        """
+        Generates a signature for the API request.
 
-# Setup BitMEX API clients
-prod_client = bitmex(test=False, api_key=BITMEX_PROD_API_KEY, api_secret=BITMEX_PROD_API_SECRET)
-testnet_client = bitmex(test=True, api_key=BITMEX_TESTNET_API_KEY, api_secret=BITMEX_TESTNET_API_SECRET)
+        Args:
+            secret (str): The API secret key.
+            verb (str): The HTTP method (GET, POST, etc.).
+            url (str): The API endpoint URL.
+            expires (int): The expiration time for the request.
+            data (str): The request payload.
 
-def get_bitmex_mid_price():
-    """Fetch mid-price from BitMEX production."""
-    orderbook = prod_client.OrderBook.OrderBook_getL2(symbol='XBTUSD', depth=1).result()
-    bid_price = next(item for item in orderbook if item['side'] == 'Buy')['price']
-    ask_price = next(item for item in orderbook if item['side'] == 'Sell')['price']
-    mid_price = (ask_price + bid_price) / 2
-    return mid_price
+        Returns:
+            str: The generated signature.
+        """
+        parsedURL = urllib.parse.urlparse(url)
+        path = parsedURL.path
+        if parsedURL.query:
+            path = path + '?' + parsedURL.query
 
-def calculate_prices(px_mid_1):
-    """Calculate new buy and sell prices based on mid-price."""
-    px1 = px_mid_1 * (1 - COST_TO_BUY)
-    px2 = px_mid_1 * (1 + COST_TO_SELL)
-    return px1, px2
+        if isinstance(data, (bytes, bytearray)):
+            data = data.decode('utf8')
 
-def place_order(client, price, side):
-    """Place limit order on BitMEX testnet."""
-    order = client.Order.Order_new(
-        symbol='XBTUSD',
-        side=side,
-        orderQty=1,  # Place a dummy quantity
-        price=price,
-        ordType='Limit'
-    ).result()
-    return order
+        message = verb + path + str(expires) + data
+        signature = hmac.new(bytes(secret, 'utf-8'), message.encode('utf-8'), digestmod=hashlib.sha256).hexdigest()
+        return signature
 
-# def main():
-#     """Main loop to periodically reprice and replace orders."""
-#     while True:
-#         start_time = time.time()
-        
-#         # Fetch mid-price from BitMEX production
-#         px_mid_1 = get_bitmex_mid_price()
-        
-#         # Calculate new buy and sell prices
-#         px1, px2 = calculate_prices(px_mid_1)
-        
-#         # Cancel existing orders (if any)
-#         testnet_client.Order.Order_cancelAll().result()
-        
-#         # Place new orders
-#         place_order(testnet_client, px1, 'Buy')
-#         place_order(testnet_client, px2, 'Sell')
-        
-#         # Measure latency
-#         latency = time.time() - start_time
-#         print(f"{datetime.now()} - Pricing and order placement latency: {latency:.2f} seconds")
-        
-#         # Wait until next repricing interval
-#         time.sleep(REPRICE_INTERVAL)
+class BackstopMarketMaker:
+    """
+    A backstop market maker that monitors a reference exchange and places orders on a target exchange.
 
-def main():
-    """Main loop to periodically fetch and print the mid-price."""
-    while True:
-        try:
-            # Fetch mid-price from BitMEX production
-            px_mid_1 = get_bitmex_mid_price()
-            
-            # Print the mid-price
-            print(f"{datetime.now()} - Mid-price: {px_mid_1:.2f} USD")
-            
-            # Wait until next fetch interval
-            time.sleep(FETCH_INTERVAL)
-        except Exception as e:
-            print(f"Error fetching price: {e}")
-            
+    Attributes:
+        reference_exchange (str): The name of the reference exchange.
+        target_exchange (str): The name of the target exchange.
+        symbol (str): The trading symbol (e.g., 'XBTUSDT').
+        buy_cost (float): The buy cost percentage.
+        sell_cost (float): The sell cost percentage.
+        interval (int): The interval in seconds between each cycle.
+        bitmex_api_key (str): The API key for BitMEX.
+        bitmex_api_secret (str): The API secret key for BitMEX.
+        buy_qty (int): The quantity to buy.
+        sell_qty (int): The quantity to sell.
+    """
+    def __init__(self, reference_exchange, target_exchange, symbol, buy_cost, sell_cost, interval, bitmex_api_key, bitmex_api_secret, buy_qty, sell_qty):
+        self.reference_exchange = reference_exchange
+        self.target_exchange = target_exchange
+        self.symbol = symbol
+        self.buy_cost = buy_cost
+        self.sell_cost = sell_cost
+        self.interval = interval
+        self.latest_price = None
+        self.latest_price_time = None  # Timestamp for the latest price
+        self.ws = None # web socket
+        self.stop_event = threading.Event() # Event to indicate when the process is terminated
+        self.connection_ready = threading.Event()  # Event to indicate WebSocket connection is ready
+
+        self.buy_qty = buy_qty
+        self.sell_qty = sell_qty
+
+        self.base_url = "https://testnet.bitmex.com/api/v1"
+        self.api_key = bitmex_api_key
+        self.api_secret = bitmex_api_secret
+        self.auth = APIKeyAuthenticator(self.base_url, self.api_key, self.api_secret)
+
+        # Start the WebSocket thread to fetch reference prices
+        self.ws_thread = threading.Thread(target=self.fetch_reference_price, name="WS-Thread")
+        self.ws_thread.start()
+
+        # Set up signal handling for graceful termination
+        signal.signal(signal.SIGINT, self.signal_handler)
+        signal.signal(signal.SIGTERM, self.signal_handler)
+
+    def fetch_reference_price(self):
+        """
+        Fetches the reference price from the WebSocket stream.
+        """
+        def on_message(ws, message):
+            data = json.loads(message)
+            self.latest_price = float(data['c'])  # 'c' is the current price in the ticker stream
+            self.latest_price_time = datetime.datetime.now()  # Record the time when price was updated
+            logger.info(f"Fetched reference price: {self.latest_price}")
+
+        def on_error(ws, error):
+            logger.error(f"WebSocket error: {error}")
+            self.stop_event.set()
+
+        def on_close(ws, close_status_code, close_msg):
+            logger.info(f"WebSocket closed with status code: {close_status_code} and message: {close_msg}")
+            self.stop_event.set()
+
+        def on_open(ws):
+            logger.info("WebSocket connection opened")
+            self.connection_ready.set()  # Indicate that the connection is ready
+
+        self.ws = websocket.WebSocketApp(
+            "wss://stream.binance.com:9443/ws/btcusdt@ticker",
+            on_message=on_message,
+            on_error=on_error,
+            on_close=on_close,
+            on_open=on_open
+        )
+
+        while not self.stop_event.is_set():
+            try:
+                self.ws.run_forever()
+            except Exception as e:
+                logger.error(f"Error in WebSocket connection: {str(e)}")
+                time.sleep(5)  # Reconnect after a short delay
+
+    def signal_handler(self, signum, frame):
+        """
+        Handles termination signals for graceful shutdown.
+
+        Args:
+            signum (int): The signal number.
+            frame (frame object): The current stack frame.
+        """
+        logger.info("Signal received, closing WebSocket connection...")
+        if self.ws:
+            self.ws.close()
+        self.stop_event.set()
+        sys.exit(0)
+
+    async def send_request(self, session, verb, endpoint, data=None):
+        """
+        Sends an authenticated HTTP request to the BitMEX API.
+
+        Args:
+            session (aiohttp.ClientSession): The HTTP session.
+            verb (str): The HTTP method (GET, POST, etc.).
+            endpoint (str): The API endpoint.
+            data (dict, optional): The request payload.
+
+        Returns:
+            dict: The response from the API.
+        """
+        url = self.base_url + endpoint
+        expires = int(round(time.time()) + 5)
+        data_str = json.dumps(data, separators=(',', ':')) if data else ''
+
+        signature = self.auth.generate_signature(self.api_secret, verb.upper(), url, expires, data_str)
+
+        headers = {
+            'api-expires': str(expires),
+            'api-key': self.api_key,
+            'api-signature': signature,
+            'Content-Type': 'application/json'
+        }
+
+        async with session.request(verb.upper(), url, headers=headers, data=data_str) as response:
+            response_text = await response.text()
+            if response.status != 200:
+                logger.error(f"HTTP request error: {response.status} {response_text}")
+                response.raise_for_status()
+            return json.loads(response_text)
+
+    async def run(self):
+        """
+        Runs the market making cycle: fetch reference price, calculate target prices, and place/cancel orders.
+        """
+        async with aiohttp.ClientSession() as session:
+            self.connection_ready.wait()  # Wait for WebSocket connection to be ready
+            while not self.stop_event.is_set():
+                start_time = time.time()
+
+                try:
+                    ref_start = time.time()
+                    if self.latest_price is None or (time.time() - self.latest_price_time.timestamp()) > 0.6:
+                        logger.info("Waiting for price update...")
+                        await asyncio.sleep(0.3)
+                        continue
+                    
+                    # ref_elapsed = time.time() - ref_start
+                    price_age = (time.time() - self.latest_price_time.timestamp()) # how much old is the last fetched price
+                    logger.info(f"Reference price: {self.latest_price:.2f}, Age: {price_age:.3f}s")
+                    
+                    logger.info("Calculating target prices...")
+                    calc_start = time.time()
+                    buy_price, sell_price = self.calculate_target_prices(self.latest_price)
+                    calc_elapsed = time.time() - calc_start
+                    logger.info(f"Calculated buy price: {buy_price:.2f}, sell price: {sell_price:.2f}")
+
+                    logger.info("Cancelling existing orders and placing new orders...")
+                    cancel_and_place_start = time.time()
+                    cancel_order_ids, buy_order_id, sell_order_id = await asyncio.gather(
+                        self.cancel_existing_orders(session),
+                        self.place_buy_order(session, buy_price),
+                        self.place_sell_order(session, sell_price)
+                    )
+                    cancel_and_place_elapsed = time.time() - cancel_and_place_start
+                    logger.info(f"Orders cancelled: {cancel_order_ids}, buy order placed: {buy_order_id}, sell order placed: {sell_order_id}. Elapsed time: {cancel_and_place_elapsed:.4f} seconds")
+
+                    end_time = time.time()
+                    latency = end_time - start_time
+                    logger.info(f"CYCLE COMPLETED. Total time: {latency:.4f} seconds \n")
+
+                except Exception as e:
+                    logger.error(f"Error occurred: {str(e)}")
+
+                await asyncio.sleep(self.interval)
+
+    def calculate_target_prices(self, reference_price):
+        """
+        Calculates the buy and sell prices based on the reference price and cost percentages.
+
+        Args:
+            reference_price (float): The current reference price.
+
+        Returns:
+            tuple: The calculated buy price and sell price.
+        """
+        tick_size = 0.5
+        buy_price = round(reference_price * (1 - self.buy_cost) / tick_size) * tick_size
+        sell_price = round(reference_price * (1 + self.sell_cost) / tick_size) * tick_size
+        return buy_price, sell_price
+
+    async def place_buy_order(self, session, buy_price):
+        """
+        Places a buy order on the target exchange.
+
+        Args:
+            session (aiohttp.ClientSession): The HTTP session.
+            buy_price (float): The buy price.
+
+        Returns:
+            str: The ID of the placed buy order.
+        """
+        response = await self.send_request(
+            session,
+            "POST",
+            "/order",
+            {
+                "symbol": self.symbol,
+                "price": buy_price,
+                "orderQty": self.buy_qty,
+                "side": "Buy",
+                "ordType": "Limit"
+            }
+        )
+        return response['orderID']
+
+    async def place_sell_order(self, session, sell_price):
+        """
+        Places a sell order on the target exchange.
+
+        Args:
+            session (aiohttp.ClientSession): The HTTP session.
+            sell_price (float): The sell price.
+
+        Returns:
+            str: The ID of the placed sell order.
+        """
+        response = await self.send_request(
+            session,
+            "POST",
+            "/order",
+            {
+                "symbol": self.symbol,
+                "price": sell_price,
+                "orderQty": self.sell_qty,
+                "side": "Sell",
+                "ordType": "Limit"
+            }
+        )
+        return response['orderID']
+
+    async def cancel_existing_orders(self, session):
+        """
+        Cancels all existing orders on the target exchange.
+
+        Args:
+            session (aiohttp.ClientSession): The HTTP session.
+
+        Returns:
+            list: A list of IDs of the cancelled orders.
+        """
+        response = await self.send_request(session, "DELETE", "/order/all")
+        return [order['orderID'] for order in response]
+
 if __name__ == "__main__":
-    main()
+    # Configuration for the market maker
+    reference_exchange = "binance"
+    target_exchange = "bitmex_testnet"
+    symbol = "XBTUSDT"
+    buy_cost = 0.0050
+    sell_cost = 0.0075
+    buy_qty = 1000 # 1000 minimum for BTCUSDT
+    sell_qty = 1000 # 1000 minimum for BTCUSDT
+    interval = 60 # seconds
+
+    # API keys for BitMEX
+    bitmex_api_key = KEYS.API_ID # replace with your own keys in str format
+    bitmex_api_secret = KEYS.API_SECRET # Ideally, dotenv Python library is used for handling secrets
+
+    # Initialize and run the market maker
+    market_maker = BackstopMarketMaker(
+        reference_exchange=reference_exchange,
+        target_exchange=target_exchange,
+        symbol=symbol,
+        buy_cost=buy_cost,
+        sell_cost=sell_cost,
+        buy_qty=buy_qty,
+        sell_qty=sell_qty,
+        interval=interval,
+        bitmex_api_key=bitmex_api_key,
+        bitmex_api_secret=bitmex_api_secret
+    )
+    asyncio.run(market_maker.run())

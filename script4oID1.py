@@ -52,6 +52,7 @@ class BackstopMarketMaker:
         self.latest_price_time = None  # Timestamp for the latest price
         self.ws = None
         self.stop_event = threading.Event()
+        self.connection_ready = threading.Event()  # Event to indicate WebSocket connection is ready
 
         self.buy_qty = buy_qty
         self.sell_qty = sell_qty
@@ -61,10 +62,11 @@ class BackstopMarketMaker:
         self.api_secret = bitmex_api_secret
         self.auth = APIKeyAuthenticator(self.base_url, self.api_key, self.api_secret)
 
+        # Start the WebSocket thread to fetch reference prices
         self.ws_thread = threading.Thread(target=self.fetch_reference_price, name="WS-Thread")
         self.ws_thread.start()
 
-        # Set up signal handling
+        # Set up signal handling for graceful termination
         signal.signal(signal.SIGINT, self.signal_handler)
         signal.signal(signal.SIGTERM, self.signal_handler)
 
@@ -85,6 +87,7 @@ class BackstopMarketMaker:
 
         def on_open(ws):
             logger.info("WebSocket connection opened")
+            self.connection_ready.set()  # Indicate that the connection is ready
 
         self.ws = websocket.WebSocketApp(
             "wss://stream.binance.com:9443/ws/btcusdt@ticker",
@@ -93,7 +96,7 @@ class BackstopMarketMaker:
             on_close=on_close,
             on_open=on_open
         )
-        
+
         while not self.stop_event.is_set():
             try:
                 self.ws.run_forever()
@@ -106,7 +109,7 @@ class BackstopMarketMaker:
         if self.ws:
             self.ws.close()
         self.stop_event.set()
-        sys.exit(0) # Helps to terminate all processes running in the terminal quickly
+        sys.exit(0)
 
     async def send_request(self, session, verb, endpoint, data=None):
         url = self.base_url + endpoint
@@ -131,20 +134,21 @@ class BackstopMarketMaker:
 
     async def run(self):
         async with aiohttp.ClientSession() as session:
+            self.connection_ready.wait()  # Wait for WebSocket connection to be ready
             while not self.stop_event.is_set():
                 start_time = time.time()
 
                 try:
                     ref_start = time.time()
-                    if self.latest_price is None or (time.time() - self.latest_price_time.timestamp())>0.8:
+                    if self.latest_price is None or (time.time() - self.latest_price_time.timestamp()) > 0.6:
                         logger.info("Waiting for price update...")
-                        await asyncio.sleep(0.5)
+                        await asyncio.sleep(0.3)
                         continue
                     
                     reference_price = self.latest_price
                     ref_elapsed = time.time() - ref_start
                     price_age = (time.time() - self.latest_price_time.timestamp()) # how much old is the last fetched price
-                    logger.info(f"Reference price:{self.latest_price:.2f}, Age:{price_age:.3f}s")
+                    logger.info(f"Reference price: {self.latest_price:.2f}, Age: {price_age:.3f}s")
                     
                     logger.info("Calculating target prices...")
                     calc_start = time.time()
@@ -154,17 +158,17 @@ class BackstopMarketMaker:
 
                     logger.info("Cancelling existing orders and placing new orders...")
                     cancel_and_place_start = time.time()
-                    await asyncio.gather(
+                    cancel_order_ids, buy_order_id, sell_order_id = await asyncio.gather(
                         self.cancel_existing_orders(session),
                         self.place_buy_order(session, buy_price),
                         self.place_sell_order(session, sell_price)
                     )
                     cancel_and_place_elapsed = time.time() - cancel_and_place_start
-                    logger.info(f"Orders cancelled and placed. Elapsed time: {cancel_and_place_elapsed:.4f} seconds")
+                    logger.info(f"Orders cancelled: {cancel_order_ids}, buy order placed: {buy_order_id}, sell order placed: {sell_order_id}. Elapsed time: {cancel_and_place_elapsed:.4f} seconds")
 
                     end_time = time.time()
                     latency = end_time - start_time
-                    logger.info(f"CYCLE COMPLETED. Total latency: {latency:.4f} seconds \n")
+                    logger.info(f"CYCLE COMPLETED. Total time: {latency:.4f} seconds \n")
 
                 except Exception as e:
                     logger.error(f"Error occurred: {str(e)}")
@@ -172,13 +176,13 @@ class BackstopMarketMaker:
                 await asyncio.sleep(self.interval)
 
     def calculate_target_prices(self, reference_price):
-        tick_size = 0.5 # helps to round off to the nearest 0.50 or 0.00
+        tick_size = 0.5
         buy_price = round(reference_price * (1 - self.buy_cost) / tick_size) * tick_size
         sell_price = round(reference_price * (1 + self.sell_cost) / tick_size) * tick_size
         return buy_price, sell_price
 
     async def place_buy_order(self, session, buy_price):
-        await self.send_request(
+        response = await self.send_request(
             session,
             "POST",
             "/order",
@@ -190,9 +194,10 @@ class BackstopMarketMaker:
                 "ordType": "Limit"
             }
         )
+        return response['orderID']
 
     async def place_sell_order(self, session, sell_price):
-        await self.send_request(
+        response = await self.send_request(
             session,
             "POST",
             "/order",
@@ -204,19 +209,21 @@ class BackstopMarketMaker:
                 "ordType": "Limit"
             }
         )
+        return response['orderID']
 
     async def cancel_existing_orders(self, session):
-        await self.send_request(session, "DELETE", "/order/all")
+        response = await self.send_request(session, "DELETE", "/order/all")
+        return [order['orderID'] for order in response]
 
 if __name__ == "__main__":
     reference_exchange = "binance"
     target_exchange = "bitmex_testnet"
     symbol = "XBTUSDT"
-    buy_cost = 0.0050 # 50 basis points = 0.5% = 0.005
-    sell_cost = 0.0075 # 75 basis points = 0.75% = 0.0075
+    buy_cost = 0.0050
+    sell_cost = 0.0075
     buy_qty = 1000
     sell_qty = 1000
-    interval = 10 # seconds
+    interval = 10
 
     bitmex_api_key = KEYS.API_ID
     bitmex_api_secret = KEYS.API_SECRET
