@@ -134,7 +134,7 @@ This network round trip is now the only significant cost in a cycle.
 
 | Approach | Time per cycle |
 |---|---|
-| Single thread, synchronous HTTP for everything ([`experiments/script3.py`](experiments/script3.py)) | ~1.8–2.5 s |
+| Single thread, synchronous HTTP for everything ([`experiments/03_signed_rest_sync.py`](experiments/03_signed_rest_sync.py)) | ~1.8–2.5 s |
 | WebSocket price thread + concurrent async REST (`market_maker.py`) | **~200–500 ms** in steady state |
 
 The first few cycles after startup are slower, for example 1.5 s and then 800 ms. After that the cycle time settles into the 200–500 ms range.
@@ -255,7 +255,7 @@ The resulting orders in the BitMEX testnet order history:
 
 ### Baseline: single thread, synchronous, all HTTP
 
-The first version ([`experiments/script3.py`](experiments/script3.py)) did every step in sequence over plain HTTP. One cycle took roughly 1.8–2.5 s:
+The first version ([`experiments/03_signed_rest_sync.py`](experiments/03_signed_rest_sync.py)) did every step in sequence over plain HTTP. One cycle took roughly 1.8–2.5 s:
 
 ```
 --- Starting new cycle ---
