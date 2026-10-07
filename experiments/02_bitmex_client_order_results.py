@@ -1,10 +1,36 @@
+"""
+Step 02: step 01 with the duplicate order placement fixed.
+
+place_orders() is now called once per cycle and returns both orders, and
+the loop prints the ID and status of every order placed or cancelled.
+
+Needs the `bitmex` package. Needs the BITMEX_API_KEY and BITMEX_API_SECRET environment variables.
+See experiments/README.md for how this step fits into the project's history.
+"""
+
 import os
 import time
 import requests
 from bitmex import bitmex
 
 class BackstopMarketMaker:
+    """
+    Quotes a bid and an ask on BitMEX around the Binance price, one request
+    at a time, using the official bitmex client.
+
+    Attributes:
+        reference_exchange (str): Where the reference price comes from. Only "binance" is supported.
+        target_exchange (str): Name of the exchange orders go to. Not used by the code.
+        symbol (str): BitMEX instrument to quote.
+        buy_cost (float): How far below the reference price to bid, as a fraction (0.005 = 50 bps).
+        sell_cost (float): How far above the reference price to ask, as a fraction (0.0075 = 75 bps).
+        interval (int): Seconds to wait between cycles.
+        client: The official bitmex Swagger client, pointed at the testnet.
+    """
     def __init__(self, reference_exchange, target_exchange, symbol, buy_cost, sell_cost, interval, bitmex_api_key, bitmex_api_secret):
+        """
+        Store the configuration and create the bitmex testnet client. Arguments are described in the class docstring.
+        """
         self.reference_exchange = reference_exchange
         self.target_exchange = target_exchange
         self.symbol = symbol
@@ -16,6 +42,17 @@ class BackstopMarketMaker:
         self.client = bitmex(test=True, api_key=bitmex_api_key, api_secret=bitmex_api_secret)
 
     def get_reference_price(self):
+        """
+        Fetch the latest BTC/USDT price from Binance's REST ticker.
+
+        The Binance symbol is hard-coded to BTCUSDT.
+
+        Returns:
+            float: The last traded price.
+
+        Raises:
+            ValueError: If reference_exchange is not "binance".
+        """
         if self.reference_exchange == "binance":
             url = f'https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT' # {self.symbol}
             response = requests.get(url)
@@ -25,12 +62,35 @@ class BackstopMarketMaker:
             raise ValueError("Unsupported reference exchange")
 
     def calculate_target_prices(self, reference_price):
+        """
+        Turn the reference price into bid and ask prices.
+
+        The bid is buy_cost below the reference and the ask is sell_cost above
+        it, both rounded to the nearest 0.5, the instrument's tick size.
+
+        Args:
+            reference_price (float): The current reference price.
+
+        Returns:
+            tuple: (buy_price, sell_price).
+        """
         tick_size = 0.5
         buy_price = round(reference_price * (1 - self.buy_cost) / tick_size) * tick_size
         sell_price = round(reference_price * (1 + self.sell_cost) / tick_size) * tick_size
         return buy_price, sell_price
 
     def place_orders(self, buy_price, sell_price):
+        """
+        Place a limit buy and a limit sell, 100 contracts each, one after the other.
+
+        Args:
+            buy_price (float): Limit price for the buy order.
+            sell_price (float): Limit price for the sell order.
+
+        Returns:
+            tuple: (buy_order, sell_order), each the (result, response) pair
+            returned by the bitmex client.
+        """
         # Place buy order
         buy_order = self.client.Order.Order_new(
             symbol=self.symbol,
@@ -52,10 +112,25 @@ class BackstopMarketMaker:
         return buy_order, sell_order
 
     def cancel_existing_orders(self):
+        """
+        Cancel every open order on the account with the bitmex client.
+
+        Returns:
+            tuple: The (result, response) pair from the bitmex client, where
+            result is the list of cancelled orders.
+        """
         cancel_result = self.client.Order.Order_cancelAll().result()
         return cancel_result
 
     def run(self):
+        """
+        Run the market-making loop forever.
+
+        Each cycle fetches the reference price, computes the quotes, cancels all
+        open orders and places new ones, printing each step, the ID and status
+        of every order, and the cycle's total time. Errors are printed and the
+        loop carries on. Sleeps `interval` seconds between cycles.
+        """
         while True:
             print("\n--- Starting new cycle ---")
             start_time = time.time()

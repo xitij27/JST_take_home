@@ -1,3 +1,13 @@
+"""
+Step 11: tighter freshness check and order ID logging.
+
+The freshness limit drops to 0.6 s with 0.3 s retries, and the cancel and
+place calls return order IDs, which are logged every cycle.
+
+Needs the BITMEX_API_KEY and BITMEX_API_SECRET environment variables.
+See experiments/README.md for how this step fits into the project's history.
+"""
+
 import aiohttp
 import asyncio
 import time
@@ -22,6 +32,17 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class APIKeyAuthenticator:
+    """
+    Signs BitMEX REST API requests with an API key and secret.
+
+    Adapted from BitMEX's reference authenticator:
+    https://github.com/BitMEX/api-connectors/blob/master/official-http/python-swaggerpy/BitMEXAPIKeyAuthenticator.py
+
+    Attributes:
+        host (str): The base URL for the API.
+        api_key (str): The API key.
+        api_secret (str): The API secret.
+    """
     def __init__(self, host, api_key, api_secret):
         """
         Initializes the APIKeyAuthenticator with the necessary credentials.
@@ -62,6 +83,10 @@ class APIKeyAuthenticator:
         return signature
 
 class BackstopMarketMaker:
+    """
+    Quotes a bid and an ask on BitMEX around a price streamed from Binance's
+    WebSocket, sending the cancel and new orders concurrently.
+    """
     def __init__(self, reference_exchange, target_exchange, symbol, buy_cost, sell_cost, interval, bitmex_api_key, bitmex_api_secret, buy_qty, sell_qty):
         """
         Initializes the BackstopMarketMaker with the necessary parameters.

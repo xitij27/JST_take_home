@@ -1,3 +1,15 @@
+"""
+Step 03: synchronous baseline with hand-signed REST requests.
+
+Replaces the `bitmex` client with direct calls to the BitMEX REST API made
+with `requests` and signed with HMAC-SHA256 (see APIKeyAuthenticator). Each
+step of the cycle is timed separately. This is the ~1.8-2.5 s per cycle
+baseline quoted in the main README.
+
+Needs the BITMEX_API_KEY and BITMEX_API_SECRET environment variables.
+See experiments/README.md for how this step fits into the project's history.
+"""
+
 import time
 import requests
 import hashlib
@@ -16,18 +28,45 @@ class APIKeyAuthenticator:
     """
 
     def __init__(self, host, api_key, api_secret):
+        """
+        Store the API host and credentials. Arguments are described in the class docstring.
+        """
         self.host = host
         self.api_key = api_key
         self.api_secret = api_secret
 
     # Forces this to apply to all requests.
     def matches(self, url):
+        """
+        Tell a Swagger client whether to authenticate a request.
+
+        Left over from BitMEX's Swagger authenticator. Not used in this script,
+        which signs requests in send_request().
+
+        Args:
+            url (str): The request URL.
+
+        Returns:
+            bool: False for the swagger.json spec itself, True otherwise.
+        """
         if "swagger.json" in url:
             return False
         return True
 
     # Add the proper headers via the `expires` scheme.
     def apply(self, r):
+        """
+        Add the api-expires, api-key and api-signature headers to a request.
+
+        Left over from BitMEX's Swagger authenticator. Not used in this script,
+        which signs requests in send_request().
+
+        Args:
+            r (requests.Request): The request to sign.
+
+        Returns:
+            requests.Request: The same request with the auth headers added.
+        """
         # 5s grace period in case of clock skew
         expires = int(round(time.time()) + 5)
         r.headers['api-expires'] = str(expires)
@@ -38,7 +77,9 @@ class APIKeyAuthenticator:
         r.headers['api-signature'] = self.generate_signature(self.api_secret, r.method, url, expires, body)
         return r
 
-    # Generates an API signature.
+    # First attempt at generate_signature(), kept for reference. Unlike the working
+    # version below, it doesn't decode a bytes body before signing, which caused
+    # the invalid-signature errors mentioned in the main README.
     # def generate_signature(self, secret, verb, url, expires, data):
     #     """Generate a request signature compatible with BitMEX."""
     #     # Parse the url so we can remove the base and extract just the path.
@@ -71,7 +112,26 @@ class APIKeyAuthenticator:
         return signature
 
 class BackstopMarketMaker:
+    """
+    Quotes a bid and an ask on BitMEX around the Binance price, using
+    hand-signed REST requests sent one at a time.
+
+    Attributes:
+        reference_exchange (str): Where the reference price comes from. Only "binance" is supported.
+        target_exchange (str): Name of the exchange orders go to. Not used by the code.
+        symbol (str): BitMEX instrument to quote.
+        buy_cost (float): How far below the reference price to bid, as a fraction (0.005 = 50 bps).
+        sell_cost (float): How far above the reference price to ask, as a fraction (0.0075 = 75 bps).
+        interval (int): Seconds to wait between cycles.
+        base_url (str): BitMEX testnet REST API base URL.
+        api_key (str): BitMEX API key.
+        api_secret (str): BitMEX API secret.
+        auth (APIKeyAuthenticator): Signs each request.
+    """
     def __init__(self, reference_exchange, target_exchange, symbol, buy_cost, sell_cost, interval, bitmex_api_key, bitmex_api_secret):
+        """
+        Store the configuration and create the request signer. Arguments are described in the class docstring.
+        """
         self.reference_exchange = reference_exchange
         self.target_exchange = target_exchange
         self.symbol = symbol
@@ -86,6 +146,17 @@ class BackstopMarketMaker:
         self.auth = APIKeyAuthenticator(self.base_url, self.api_key, self.api_secret)
 
     def get_reference_price(self):
+        """
+        Fetch the latest BTC/USDT price from Binance's REST ticker.
+
+        The Binance symbol is hard-coded to BTCUSDT.
+
+        Returns:
+            float: The last traded price.
+
+        Raises:
+            ValueError: If reference_exchange is not "binance".
+        """
         if self.reference_exchange == "binance":
             url = f'https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT'  # {self.symbol}
             response = requests.get(url)
@@ -95,12 +166,40 @@ class BackstopMarketMaker:
             raise ValueError("Unsupported reference exchange")
 
     def calculate_target_prices(self, reference_price):
+        """
+        Turn the reference price into bid and ask prices.
+
+        The bid is buy_cost below the reference and the ask is sell_cost above
+        it, both rounded to the nearest 0.5, the instrument's tick size.
+
+        Args:
+            reference_price (float): The current reference price.
+
+        Returns:
+            tuple: (buy_price, sell_price).
+        """
         tick_size = 0.5
         buy_price = round(reference_price * (1 - self.buy_cost) / tick_size) * tick_size
         sell_price = round(reference_price * (1 + self.sell_cost) / tick_size) * tick_size
         return buy_price, sell_price
 
     def send_request(self, verb, endpoint, data=None):
+        """
+        Send a signed request to the BitMEX REST API.
+
+        Only POST (with a JSON body) and DELETE (without one) are supported.
+
+        Args:
+            verb (str): HTTP method.
+            endpoint (str): Path relative to base_url, for example "/order".
+            data (dict, optional): JSON body for POST requests.
+
+        Returns:
+            dict or list: The parsed JSON response.
+
+        Raises:
+            ValueError: For an unsupported verb or a non-200 response.
+        """
         url = self.base_url + endpoint
         expires = int(round(time.time()) + 5)
         data_str = json.dumps(data, separators=(',', ':')) if data else ''
@@ -133,6 +232,16 @@ class BackstopMarketMaker:
         return response.json()
 
     def place_orders(self, buy_price, sell_price):
+        """
+        Place a limit buy and a limit sell, 100 contracts each, one after the other.
+
+        Args:
+            buy_price (float): Limit price for the buy order.
+            sell_price (float): Limit price for the sell order.
+
+        Returns:
+            tuple: (buy_order, sell_order), the order objects returned by BitMEX.
+        """
         order_qty = 100  # Must be a multiple of 100
 
         # Place buy order
@@ -164,9 +273,23 @@ class BackstopMarketMaker:
         return buy_order, sell_order
 
     def cancel_existing_orders(self):
+        """
+        Cancel every open order on the account (DELETE /order/all).
+
+        Returns:
+            list: The cancelled orders, as returned by BitMEX.
+        """
         return self.send_request("DELETE", "/order/all")
 
     def run(self):
+        """
+        Run the market-making loop forever.
+
+        Each cycle fetches the reference price, computes the quotes, cancels all
+        open orders and places new ones, one request at a time, and prints how
+        long each step took. Errors are printed and the loop carries on. Sleeps
+        `interval` seconds between cycles.
+        """
         while True:
             print("\n--- Starting new cycle ---")
             start_time = time.time()

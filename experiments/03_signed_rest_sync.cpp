@@ -1,3 +1,19 @@
+// Step 03 (C++): unfinished port of 03_signed_rest_sync.py using libcurl and OpenSSL.
+//
+// Intended flow, every `interval` seconds: fetch the Binance BTC/USDT price, compute
+// a bid and an ask around it, cancel all BitMEX testnet orders and place the new
+// ones, one request at a time.
+//
+// Not finished, and not meant to be built or run as is:
+//   - get_reference_price() returns a hard-coded placeholder instead of parsing
+//     Binance's response.
+//   - generate_signature() base64-encodes an HMAC over the full URL, but BitMEX
+//     expects a hex-encoded HMAC over the path, so BitMEX would reject every
+//     signed request.
+//
+// Reads BITMEX_API_KEY and BITMEX_API_SECRET from the environment.
+// See experiments/README.md for how this step fits into the project's history.
+
 #include <cstdlib>
 #include <iostream>
 #include <string>
@@ -12,7 +28,8 @@
 
 using namespace std;
 
-// Utility function to base64 encode the signature
+// Base64-encode a byte buffer with OpenSSL's BIO API. Used for the request
+// signature, although BitMEX actually expects it hex-encoded.
 string base64_encode(const unsigned char* buffer, size_t length) {
     BIO* bio;
     BIO* b64;
@@ -32,7 +49,9 @@ string base64_encode(const unsigned char* buffer, size_t length) {
     return result;
 }
 
-// Utility function to generate HMAC SHA256 signature
+// HMAC-SHA256 of verb + url + expires + data, keyed with the API secret and
+// returned base64-encoded. BitMEX instead signs the path (not the full URL) and
+// expects the digest hex-encoded, so these signatures would be rejected.
 string generate_signature(const string& secret, const string& verb, const string& url, int expires, const string& data) {
     string message = verb + url + to_string(expires) + data;
     unsigned char* digest;
@@ -41,7 +60,12 @@ string generate_signature(const string& secret, const string& verb, const string
     return base64_encode(digest, SHA256_DIGEST_LENGTH);
 }
 
-// Utility function to perform HTTP request
+// Send an HTTP request with libcurl and return the response body. Supports GET,
+// POST (with a JSON body) and DELETE. Always adds the BitMEX auth headers, even
+// for the Binance request, which passes empty credentials. api-expires is meant
+// to be now + 5 s, but dividing system_clock ticks by 1,000,000 only gives
+// seconds when the clock counts microseconds. Errors are printed, and whatever
+// was received (possibly nothing) is returned.
 string perform_request(const string& url, const string& verb, const string& data, const string& api_key, const string& api_secret) {
     CURL* curl;
     CURLcode res;
@@ -87,14 +111,20 @@ string perform_request(const string& url, const string& verb, const string& data
     return read_buffer;
 }
 
-// Class to handle market making
+// Quotes a bid and an ask around the reference price on the BitMEX testnet, one
+// request at a time. C++ counterpart of BackstopMarketMaker in
+// 03_signed_rest_sync.py.
 class BackstopMarketMaker {
 public:
+    // Store the credentials and quoting parameters. Orders go to the BitMEX testnet.
     BackstopMarketMaker(const string& api_key, const string& api_secret, const string& symbol, double buy_cost, double sell_cost, int interval)
         : api_key(api_key), api_secret(api_secret), symbol(symbol), buy_cost(buy_cost), sell_cost(sell_cost), interval(interval) {
         base_url = "https://testnet.bitmex.com/api/v1";
     }
 
+    // Run the market-making loop forever: fetch the reference price, compute the
+    // quotes, cancel all orders and place new ones, print each step and the
+    // cycle's total time, then sleep `interval` seconds.
     void run() {
         while (true) {
             cout << "\n--- Starting new cycle ---" << endl;
@@ -135,6 +165,7 @@ public:
     }
 
 private:
+    // Configuration and credentials.
     string base_url;
     string api_key;
     string api_secret;
@@ -143,6 +174,8 @@ private:
     double sell_cost;
     int interval;
 
+    // Meant to fetch the BTC/USDT price from Binance's REST ticker. Unfinished: the
+    // response is fetched but never parsed, and a placeholder price is returned.
     double get_reference_price() {
         string url = "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT";
         string response = perform_request(url, "GET", "", "", "");
@@ -151,6 +184,8 @@ private:
         return 50000.0; // Placeholder value
     }
 
+    // Bid buy_cost below and ask sell_cost above the reference price, both rounded
+    // to the 0.5 tick size. Returns (buy_price, sell_price).
     pair<double, double> calculate_target_prices(double reference_price) {
         double tick_size = 0.5;
         double buy_price = round(reference_price * (1 - buy_cost) / tick_size) * tick_size;
@@ -158,18 +193,24 @@ private:
         return make_pair(buy_price, sell_price);
     }
 
+    // Place a 100-contract limit order on the given side ("Buy" or "Sell") at
+    // price. Returns the raw response body.
     string place_order(double price, const string& side) {
         string url = base_url + "/order";
         string data = "{\"symbol\":\"" + symbol + "\",\"price\":" + to_string(price) + ",\"orderQty\":100,\"side\":\"" + side + "\",\"ordType\":\"Limit\"}";
         return perform_request(url, "POST", data, api_key, api_secret);
     }
 
+    // Cancel every open order (DELETE /order/all). Returns the raw response body.
     string cancel_existing_orders() {
         string url = base_url + "/order/all";
         return perform_request(url, "DELETE", "", api_key, api_secret);
     }
 };
 
+// Read the credentials from the environment, configure the market maker and run
+// it. Both variables must be set: getenv returns null otherwise, and building a
+// std::string from null is undefined behaviour.
 int main() {
     string api_key = getenv("BITMEX_API_KEY");
     string api_secret = getenv("BITMEX_API_SECRET");

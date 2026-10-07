@@ -1,3 +1,19 @@
+"""
+Backstop market maker for the BitMEX testnet.
+
+A background thread streams the BTC/USDT last price from Binance's ticker
+WebSocket. Every `interval` seconds the main asyncio loop quotes a bid
+`buy_cost` below and an ask `sell_cost` above that price on BitMEX. Each
+cycle cancels the previous cycle's orders and places the new ones
+concurrently.
+
+Usage:
+    export BITMEX_API_KEY=... BITMEX_API_SECRET=...
+    python market_maker.py
+
+See README.md for configuration, design notes and known limitations.
+"""
+
 import aiohttp
 import asyncio
 import time
@@ -31,6 +47,9 @@ class APIKeyAuthenticator:
         api_secret (str): The API secret key.
     """
     def __init__(self, host, api_key, api_secret):
+        """
+        Store the API host and credentials. Arguments are described in the class docstring.
+        """
         self.host = host
         self.api_key = api_key
         self.api_secret = api_secret
@@ -78,6 +97,10 @@ class BackstopMarketMaker:
         sell_qty (int): The quantity to sell.
     """
     def __init__(self, reference_exchange, target_exchange, symbol, buy_cost, sell_cost, interval, bitmex_api_key, bitmex_api_secret, buy_qty, sell_qty):
+        """
+        Store the configuration, set up request signing, start the WebSocket
+        price thread and install SIGINT/SIGTERM handlers. Arguments are described in the class docstring.
+        """
         self.reference_exchange = reference_exchange
         self.target_exchange = target_exchange
         self.symbol = symbol
@@ -112,20 +135,50 @@ class BackstopMarketMaker:
         Fetches the reference price from the WebSocket stream.
         """
         def on_message(ws, message):
+            """
+            Cache the last price (the 'c' field) from a ticker message, record when
+            it arrived and log it.
+
+            Args:
+                ws (WebSocketApp): The WebSocket connection.
+                message (str): Raw JSON ticker message.
+            """
             data = json.loads(message)
             self.latest_price = float(data['c'])  # 'c' is the current price in the ticker stream
             self.latest_price_time = datetime.datetime.now()  # Record the time when price was updated
             logger.info(f"Fetched reference price: {self.latest_price}")
 
         def on_error(ws, error):
+            """
+            Log a WebSocket error and set stop_event, which stops the bot.
+
+            Args:
+                ws (WebSocketApp): The WebSocket connection.
+                error (Exception): The error raised by the connection.
+            """
             logger.error(f"WebSocket error: {error}")
             self.stop_event.set()
 
         def on_close(ws, close_status_code, close_msg):
+            """
+            Log the close code and message and set stop_event, which stops the bot.
+
+            Args:
+                ws (WebSocketApp): The WebSocket connection.
+                close_status_code (int or None): WebSocket close code, if any.
+                close_msg (str or None): Close reason, if any.
+            """
             logger.info(f"WebSocket closed with status code: {close_status_code} and message: {close_msg}")
             self.stop_event.set()
 
         def on_open(ws):
+            """
+            Log that the connection is open and set connection_ready, so run() can
+            start quoting.
+
+            Args:
+                ws (WebSocketApp): The WebSocket connection.
+            """
             logger.info("WebSocket connection opened")
             self.connection_ready.set()  # Indicate that the connection is ready
 
