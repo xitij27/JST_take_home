@@ -10,9 +10,17 @@ import threading
 import websocket
 import signal
 import sys
-import KEYS
+import logging
+import os
 
-# adapted from https://github.com/BitMEX/api-connectors/blob/master/official-http/python-swaggerpy/BitMEXAPIKeyAuthenticator.py
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] [%(threadName)s] %(message)s",
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger(__name__)
+
 class APIKeyAuthenticator:
     def __init__(self, host, api_key, api_secret):
         self.host = host
@@ -33,7 +41,7 @@ class APIKeyAuthenticator:
         return signature
 
 class BackstopMarketMaker:
-    def __init__(self, reference_exchange, target_exchange, symbol, buy_cost, sell_cost, interval, bitmex_api_key, bitmex_api_secret):
+    def __init__(self, reference_exchange, target_exchange, symbol, buy_cost, sell_cost, interval, bitmex_api_key, bitmex_api_secret, buy_qty, sell_qty):
         self.reference_exchange = reference_exchange
         self.target_exchange = target_exchange
         self.symbol = symbol
@@ -41,15 +49,19 @@ class BackstopMarketMaker:
         self.sell_cost = sell_cost
         self.interval = interval
         self.latest_price = None
+        self.latest_price_time = None  # Timestamp for the latest price
         self.ws = None
         self.stop_event = threading.Event()
+
+        self.buy_qty = buy_qty
+        self.sell_qty = sell_qty
 
         self.base_url = "https://testnet.bitmex.com/api/v1"
         self.api_key = bitmex_api_key
         self.api_secret = bitmex_api_secret
         self.auth = APIKeyAuthenticator(self.base_url, self.api_key, self.api_secret)
 
-        self.ws_thread = threading.Thread(target=self.fetch_reference_price)
+        self.ws_thread = threading.Thread(target=self.fetch_reference_price, name="WS-Thread")
         self.ws_thread.start()
 
         # Set up signal handling
@@ -60,17 +72,19 @@ class BackstopMarketMaker:
         def on_message(ws, message):
             data = json.loads(message)
             self.latest_price = float(data['c'])  # 'c' is the current price in the ticker stream
+            self.latest_price_time = datetime.datetime.now()  # Record the time when price was updated
+            logger.info(f"Fetched reference price: {self.latest_price}")
 
         def on_error(ws, error):
-            print(f"WebSocket error: {error}")
+            logger.error(f"WebSocket error: {error}")
             self.stop_event.set()
 
-        def on_close(ws):
-            print("WebSocket closed")
+        def on_close(ws, close_status_code, close_msg):
+            logger.info(f"WebSocket closed with status code: {close_status_code} and message: {close_msg}")
             self.stop_event.set()
 
         def on_open(ws):
-            print("WebSocket connection opened")
+            logger.info("WebSocket connection opened")
 
         self.ws = websocket.WebSocketApp(
             "wss://stream.binance.com:9443/ws/btcusdt@ticker",
@@ -84,15 +98,15 @@ class BackstopMarketMaker:
             try:
                 self.ws.run_forever()
             except Exception as e:
-                print(f"Error in WebSocket connection: {str(e)}")
+                logger.error(f"Error in WebSocket connection: {str(e)}")
                 time.sleep(5)  # Reconnect after a short delay
 
     def signal_handler(self, signum, frame):
-        print("Signal received, closing WebSocket connection...")
+        logger.info("Signal received, closing WebSocket connection...")
         if self.ws:
             self.ws.close()
         self.stop_event.set()
-        sys.exit(0)
+        sys.exit(0) # Helps to terminate all processes running in the terminal quickly
 
     async def send_request(self, session, verb, endpoint, data=None):
         url = self.base_url + endpoint
@@ -111,7 +125,8 @@ class BackstopMarketMaker:
         async with session.request(verb.upper(), url, headers=headers, data=data_str) as response:
             response_text = await response.text()
             if response.status != 200:
-                raise ValueError(f"Error: {response.status} {response_text}")
+                logger.error(f"HTTP request error: {response.status} {response_text}")
+                response.raise_for_status()
             return json.loads(response_text)
 
     async def run(self):
@@ -120,23 +135,24 @@ class BackstopMarketMaker:
                 start_time = time.time()
 
                 try:
-                    print("Getting reference price...")
                     ref_start = time.time()
-                    if self.latest_price is None:
-                        print("Waiting for the first price update...")
-                        await asyncio.sleep(1)
+                    if self.latest_price is None or (time.time() - self.latest_price_time.timestamp())>0.8:
+                        logger.info("Waiting for price update...")
+                        await asyncio.sleep(0.5)
                         continue
+                    
                     reference_price = self.latest_price
                     ref_elapsed = time.time() - ref_start
-                    print(f"get_reference_price() elapsed time: {ref_elapsed:.4f} seconds", datetime.datetime.now())
+                    price_age = (time.time() - self.latest_price_time.timestamp()) # how much old is the last fetched price
+                    logger.info(f"Reference price:{self.latest_price:.2f}, Age:{price_age:.3f}s")
                     
-                    print("Calculating target prices...")
+                    logger.info("Calculating target prices...")
                     calc_start = time.time()
-                    buy_price, sell_price = self.calculate_target_prices(reference_price)
+                    buy_price, sell_price = self.calculate_target_prices(self.latest_price)
                     calc_elapsed = time.time() - calc_start
-                    print(f"calculate_target_prices() elapsed time: {calc_elapsed:.4f} seconds", datetime.datetime.now())
+                    logger.info(f"Calculated buy price: {buy_price:.2f}, sell price: {sell_price:.2f}")
 
-                    print("Cancelling existing orders and placing new orders...")
+                    logger.info("Cancelling existing orders and placing new orders...")
                     cancel_and_place_start = time.time()
                     await asyncio.gather(
                         self.cancel_existing_orders(session),
@@ -144,26 +160,24 @@ class BackstopMarketMaker:
                         self.place_sell_order(session, sell_price)
                     )
                     cancel_and_place_elapsed = time.time() - cancel_and_place_start
-                    print(f"cancel_existing_orders_and_place_orders() elapsed time: {cancel_and_place_elapsed:.4f} seconds", datetime.datetime.now())
+                    logger.info(f"Orders cancelled and placed. Elapsed time: {cancel_and_place_elapsed:.4f} seconds")
 
                     end_time = time.time()
                     latency = end_time - start_time
-                    print(f"Cycle completed. Total latency: {latency:.4f} seconds", datetime.datetime.now(), "\n\n")
+                    logger.info(f"CYCLE COMPLETED. Total latency: {latency:.4f} seconds \n")
 
                 except Exception as e:
-                    print(f"Error occurred: {str(e)}")
+                    logger.error(f"Error occurred: {str(e)}")
 
                 await asyncio.sleep(self.interval)
 
     def calculate_target_prices(self, reference_price):
-        tick_size = 0.5
+        tick_size = 0.5 # helps to round off to the nearest 0.50 or 0.00
         buy_price = round(reference_price * (1 - self.buy_cost) / tick_size) * tick_size
         sell_price = round(reference_price * (1 + self.sell_cost) / tick_size) * tick_size
         return buy_price, sell_price
 
     async def place_buy_order(self, session, buy_price):
-        order_qty = 100
-
         await self.send_request(
             session,
             "POST",
@@ -171,15 +185,13 @@ class BackstopMarketMaker:
             {
                 "symbol": self.symbol,
                 "price": buy_price,
-                "orderQty": order_qty,
+                "orderQty": self.buy_qty,
                 "side": "Buy",
                 "ordType": "Limit"
             }
         )
 
     async def place_sell_order(self, session, sell_price):
-        order_qty = 100
-
         await self.send_request(
             session,
             "POST",
@@ -187,7 +199,7 @@ class BackstopMarketMaker:
             {
                 "symbol": self.symbol,
                 "price": sell_price,
-                "orderQty": order_qty,
+                "orderQty": self.sell_qty,
                 "side": "Sell",
                 "ordType": "Limit"
             }
@@ -199,13 +211,15 @@ class BackstopMarketMaker:
 if __name__ == "__main__":
     reference_exchange = "binance"
     target_exchange = "bitmex_testnet"
-    symbol = "XBTUSD"
+    symbol = "XBTUSDT"
     buy_cost = 0.0050 # 50 basis points = 0.5% = 0.005
     sell_cost = 0.0075 # 75 basis points = 0.75% = 0.0075
-    interval = 5 # seconds
+    buy_qty = 1000
+    sell_qty = 1000
+    interval = 10 # seconds
 
-    bitmex_api_key = KEYS.API_ID
-    bitmex_api_secret = KEYS.API_SECRET
+    bitmex_api_key = os.environ["BITMEX_API_KEY"]
+    bitmex_api_secret = os.environ["BITMEX_API_SECRET"]
 
     market_maker = BackstopMarketMaker(
         reference_exchange=reference_exchange,
@@ -213,6 +227,8 @@ if __name__ == "__main__":
         symbol=symbol,
         buy_cost=buy_cost,
         sell_cost=sell_cost,
+        buy_qty=buy_qty,
+        sell_qty=sell_qty,
         interval=interval,
         bitmex_api_key=bitmex_api_key,
         bitmex_api_secret=bitmex_api_secret

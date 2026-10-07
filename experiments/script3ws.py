@@ -1,3 +1,4 @@
+import os
 import requests
 import time
 import hashlib
@@ -177,8 +178,8 @@ if __name__ == "__main__":
     sell_qty = 100
     interval = 5
 
-    bitmex_api_key = 'isZdN8ybNIMSinAk9WztI-Fr'
-    bitmex_api_secret = 'Aeyzah7-8ML26kXxDGEHmCGfPey_z66alSnz8PiAJwV1zDzP'
+    bitmex_api_key = os.environ["BITMEX_API_KEY"]
+    bitmex_api_secret = os.environ["BITMEX_API_SECRET"]
 
     market_maker = BackstopMarketMaker(
         reference_exchange=reference_exchange,

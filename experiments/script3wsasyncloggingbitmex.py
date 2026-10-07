@@ -11,7 +11,7 @@ import websocket
 import signal
 import sys
 import logging
-import KEYS
+import os
 import bitmex
 
 # Configure logging
@@ -190,8 +190,8 @@ if __name__ == "__main__":
     sell_qty = 1000
     interval = 10  # seconds
 
-    bitmex_api_key = KEYS.API_ID
-    bitmex_api_secret = KEYS.API_SECRET
+    bitmex_api_key = os.environ["BITMEX_API_KEY"]
+    bitmex_api_secret = os.environ["BITMEX_API_SECRET"]
 
     market_maker = BackstopMarketMaker(
         reference_exchange=reference_exchange,

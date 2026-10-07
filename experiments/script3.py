@@ -4,7 +4,7 @@ import hashlib
 import hmac
 import json
 import urllib.parse
-import KEYS
+import os
 
 
 class APIKeyAuthenticator:
@@ -231,8 +231,8 @@ if __name__ == "__main__":
     interval = 60  # 1 minute
 
     # Replace with your actual BitMEX API key and secret
-    bitmex_api_key = KEYS.API_ID
-    bitmex_api_secret = KEYS.API_SECRET
+    bitmex_api_key = os.environ["BITMEX_API_KEY"]
+    bitmex_api_secret = os.environ["BITMEX_API_SECRET"]
 
     market_maker = BackstopMarketMaker(
         reference_exchange=reference_exchange,

@@ -6,8 +6,13 @@ import hashlib
 import hmac
 import json
 import urllib.parse
-import KEYS
+import threading
+import websocket
+import signal
+import sys
+import os
 
+# adapted from https://github.com/BitMEX/api-connectors/blob/master/official-http/python-swaggerpy/BitMEXAPIKeyAuthenticator.py
 class APIKeyAuthenticator:
     def __init__(self, host, api_key, api_secret):
         self.host = host
@@ -35,11 +40,59 @@ class BackstopMarketMaker:
         self.buy_cost = buy_cost
         self.sell_cost = sell_cost
         self.interval = interval
+        self.latest_price = None
+        self.ws = None
+        self.stop_event = threading.Event()
 
         self.base_url = "https://testnet.bitmex.com/api/v1"
         self.api_key = bitmex_api_key
         self.api_secret = bitmex_api_secret
         self.auth = APIKeyAuthenticator(self.base_url, self.api_key, self.api_secret)
+
+        self.ws_thread = threading.Thread(target=self.fetch_reference_price)
+        self.ws_thread.start()
+
+        # Set up signal handling
+        signal.signal(signal.SIGINT, self.signal_handler)
+        signal.signal(signal.SIGTERM, self.signal_handler)
+
+    def fetch_reference_price(self):
+        def on_message(ws, message):
+            data = json.loads(message)
+            self.latest_price = float(data['c'])  # 'c' is the current price in the ticker stream
+
+        def on_error(ws, error):
+            print(f"WebSocket error: {error}")
+            self.stop_event.set()
+
+        def on_close(ws):
+            print("WebSocket closed")
+            self.stop_event.set()
+
+        def on_open(ws):
+            print("WebSocket connection opened")
+
+        self.ws = websocket.WebSocketApp(
+            "wss://stream.binance.com:9443/ws/btcusdt@ticker",
+            on_message=on_message,
+            on_error=on_error,
+            on_close=on_close,
+            on_open=on_open
+        )
+        
+        while not self.stop_event.is_set():
+            try:
+                self.ws.run_forever()
+            except Exception as e:
+                print(f"Error in WebSocket connection: {str(e)}")
+                time.sleep(5)  # Reconnect after a short delay
+
+    def signal_handler(self, signum, frame):
+        print("Signal received, closing WebSocket connection...")
+        if self.ws:
+            self.ws.close()
+        self.stop_event.set()
+        sys.exit(0)
 
     async def send_request(self, session, verb, endpoint, data=None):
         url = self.base_url + endpoint
@@ -56,20 +109,24 @@ class BackstopMarketMaker:
         }
 
         async with session.request(verb.upper(), url, headers=headers, data=data_str) as response:
-            response_text = await response.text()            
+            response_text = await response.text()
             if response.status != 200:
                 raise ValueError(f"Error: {response.status} {response_text}")
             return json.loads(response_text)
 
     async def run(self):
         async with aiohttp.ClientSession() as session:
-            while True:
+            while not self.stop_event.is_set():
                 start_time = time.time()
 
                 try:
                     print("Getting reference price...")
                     ref_start = time.time()
-                    reference_price = await self.get_reference_price(session)
+                    if self.latest_price is None:
+                        print("Waiting for the first price update...")
+                        await asyncio.sleep(1)
+                        continue
+                    reference_price = self.latest_price
                     ref_elapsed = time.time() - ref_start
                     print(f"get_reference_price() elapsed time: {ref_elapsed:.4f} seconds", datetime.datetime.now())
                     
@@ -79,17 +136,15 @@ class BackstopMarketMaker:
                     calc_elapsed = time.time() - calc_start
                     print(f"calculate_target_prices() elapsed time: {calc_elapsed:.4f} seconds", datetime.datetime.now())
 
-                    print("Cancelling existing orders...")
-                    cancel_start = time.time()
-                    await self.cancel_existing_orders(session)
-                    cancel_elapsed = time.time() - cancel_start
-                    print(f"cancel_existing_orders() elapsed time: {cancel_elapsed:.4f} seconds", datetime.datetime.now())
-                    
-                    print("Placing new orders...")
-                    place_start = time.time()
-                    await self.place_orders(session, buy_price, sell_price)
-                    place_elapsed = time.time() - place_start
-                    print(f"place_orders() elapsed time: {place_elapsed:.4f} seconds", datetime.datetime.now())
+                    print("Cancelling existing orders and placing new orders...")
+                    cancel_and_place_start = time.time()
+                    await asyncio.gather(
+                        self.cancel_existing_orders(session),
+                        self.place_buy_order(session, buy_price),
+                        self.place_sell_order(session, sell_price)
+                    )
+                    cancel_and_place_elapsed = time.time() - cancel_and_place_start
+                    print(f"cancel_existing_orders_and_place_orders() elapsed time: {cancel_and_place_elapsed:.4f} seconds", datetime.datetime.now())
 
                     end_time = time.time()
                     latency = end_time - start_time
@@ -100,22 +155,13 @@ class BackstopMarketMaker:
 
                 await asyncio.sleep(self.interval)
 
-    async def get_reference_price(self, session):
-        if self.reference_exchange == "binance":
-            url = f'https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT'
-            async with session.get(url) as response:
-                data = await response.json()
-                return float(data['price'])
-        else:
-            raise ValueError("Unsupported reference exchange")
-
     def calculate_target_prices(self, reference_price):
         tick_size = 0.5
         buy_price = round(reference_price * (1 - self.buy_cost) / tick_size) * tick_size
         sell_price = round(reference_price * (1 + self.sell_cost) / tick_size) * tick_size
         return buy_price, sell_price
 
-    async def place_orders(self, session, buy_price, sell_price):
+    async def place_buy_order(self, session, buy_price):
         order_qty = 100
 
         await self.send_request(
@@ -130,6 +176,9 @@ class BackstopMarketMaker:
                 "ordType": "Limit"
             }
         )
+
+    async def place_sell_order(self, session, sell_price):
+        order_qty = 100
 
         await self.send_request(
             session,
@@ -153,10 +202,10 @@ if __name__ == "__main__":
     symbol = "XBTUSD"
     buy_cost = 0.0050 # 50 basis points = 0.5% = 0.005
     sell_cost = 0.0075 # 75 basis points = 0.75% = 0.0075
-    interval = 5
+    interval = 5 # seconds
 
-    bitmex_api_key = KEYS.API_ID
-    bitmex_api_secret = KEYS.API_SECRET
+    bitmex_api_key = os.environ["BITMEX_API_KEY"]
+    bitmex_api_secret = os.environ["BITMEX_API_SECRET"]
 
     market_maker = BackstopMarketMaker(
         reference_exchange=reference_exchange,

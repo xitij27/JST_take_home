@@ -1,3 +1,4 @@
+import os
 import time
 import requests
 from bitmex import bitmex
@@ -24,6 +25,8 @@ class BackstopMarketMaker:
             raise ValueError("Unsupported reference exchange")
 
     def calculate_target_prices(self, reference_price):
+        # buy_price = reference_price * (1 - self.buy_cost)
+        # sell_price = reference_price * (1 + self.sell_cost)
         tick_size = 0.5
         buy_price = round(reference_price * (1 - self.buy_cost) / tick_size) * tick_size
         sell_price = round(reference_price * (1 + self.sell_cost) / tick_size) * tick_size
@@ -31,7 +34,7 @@ class BackstopMarketMaker:
 
     def place_orders(self, buy_price, sell_price):
         # Place buy order
-        buy_order = self.client.Order.Order_new(
+        self.client.Order.Order_new(
             symbol=self.symbol,
             price=buy_price,
             orderQty=100,
@@ -40,7 +43,7 @@ class BackstopMarketMaker:
         ).result()
 
         # Place sell order
-        sell_order = self.client.Order.Order_new(
+        self.client.Order.Order_new(
             symbol=self.symbol,
             price=sell_price,
             orderQty=100,
@@ -48,12 +51,33 @@ class BackstopMarketMaker:
             ordType='Limit'
         ).result()
 
-        return buy_order, sell_order
-
     def cancel_existing_orders(self):
-        cancel_result = self.client.Order.Order_cancelAll().result()
-        return cancel_result
+        self.client.Order.Order_cancelAll().result()
 
+    # def run(self):
+    #     while True:
+    #         start_time = time.time()
+
+    #         # Get reference price
+    #         reference_price = self.get_reference_price()
+
+    #         print(reference_price)
+
+    #         # Calculate target prices
+    #         buy_price, sell_price = self.calculate_target_prices(reference_price)
+
+    #         # Cancel existing orders
+    #         self.cancel_existing_orders()
+
+    #         # Place new orders
+    #         self.place_orders(buy_price, sell_price)
+
+    #         end_time = time.time()
+    #         latency = end_time - start_time
+    #         print(f"Latency: {latency:.4f} seconds")
+
+    #         # Wait for the next interval
+    #         time.sleep(self.interval)
     def run(self):
         while True:
             print("\n--- Starting new cycle ---")
@@ -71,13 +95,13 @@ class BackstopMarketMaker:
                 
                 print("3. Cancelling existing orders...")
                 cancel_result = self.cancel_existing_orders()
-                for order in cancel_result[0]:
-                    print(f"   Canceled order ID: {order['orderID']} Status: {order['ordStatus']}")
+                print(f"   Cancel result: {cancel_result}")
                 
                 print("4. Placing new orders...")
-                buy_order, sell_order = self.place_orders(buy_price, sell_price)
-                print(f"   Buy order ID: {buy_order[0]['orderID']} Status: {buy_order[0]['ordStatus']}")
-                print(f"   Sell order ID: {sell_order[0]['orderID']} Status: {sell_order[0]['ordStatus']}")
+                buy_order = self.place_orders(buy_price, sell_price)
+                print(f"   Buy order result: {buy_order}")
+                sell_order = self.place_orders(sell_price, buy_price)
+                print(f"   Sell order result: {sell_order}")
                 
                 end_time = time.time()
                 latency = end_time - start_time
@@ -89,7 +113,6 @@ class BackstopMarketMaker:
             print(f"Waiting for {self.interval} seconds before next cycle...")
             time.sleep(self.interval)
 
-
 if __name__ == "__main__":
     reference_exchange = "binance"
     target_exchange = "bitmex_testnet"
@@ -99,8 +122,8 @@ if __name__ == "__main__":
     interval = 60  # 1 minute
 
     # Replace with your actual Bitmex API key and secret
-    bitmex_api_key = 'isZdN8ybNIMSinAk9WztI-Fr'
-    bitmex_api_secret = 'Aeyzah7-8ML26kXxDGEHmCGfPey_z66alSnz8PiAJwV1zDzP'
+    bitmex_api_key = os.environ["BITMEX_API_KEY"]
+    bitmex_api_secret = os.environ["BITMEX_API_SECRET"]
 
     market_maker = BackstopMarketMaker(
         reference_exchange=reference_exchange,

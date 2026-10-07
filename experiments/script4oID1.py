@@ -11,7 +11,7 @@ import websocket
 import signal
 import sys
 import logging
-import KEYS
+import os
 
 # Configure logging
 logging.basicConfig(
@@ -22,33 +22,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class APIKeyAuthenticator:
-    """
-    Handles API key authentication for requests.
-
-    Attributes:
-        host (str): The base URL for the API.
-        api_key (str): The API key.
-        api_secret (str): The API secret key.
-    """
     def __init__(self, host, api_key, api_secret):
         self.host = host
         self.api_key = api_key
         self.api_secret = api_secret
 
     def generate_signature(self, secret, verb, url, expires, data):
-        """
-        Generates a signature for the API request.
-
-        Args:
-            secret (str): The API secret key.
-            verb (str): The HTTP method (GET, POST, etc.).
-            url (str): The API endpoint URL.
-            expires (int): The expiration time for the request.
-            data (str): The request payload.
-
-        Returns:
-            str: The generated signature.
-        """
         parsedURL = urllib.parse.urlparse(url)
         path = parsedURL.path
         if parsedURL.query:
@@ -62,21 +41,6 @@ class APIKeyAuthenticator:
         return signature
 
 class BackstopMarketMaker:
-    """
-    A backstop market maker that monitors a reference exchange and places orders on a target exchange.
-
-    Attributes:
-        reference_exchange (str): The name of the reference exchange.
-        target_exchange (str): The name of the target exchange.
-        symbol (str): The trading symbol (e.g., 'XBTUSDT').
-        buy_cost (float): The buy cost percentage.
-        sell_cost (float): The sell cost percentage.
-        interval (int): The interval in seconds between each cycle.
-        bitmex_api_key (str): The API key for BitMEX.
-        bitmex_api_secret (str): The API secret key for BitMEX.
-        buy_qty (int): The quantity to buy.
-        sell_qty (int): The quantity to sell.
-    """
     def __init__(self, reference_exchange, target_exchange, symbol, buy_cost, sell_cost, interval, bitmex_api_key, bitmex_api_secret, buy_qty, sell_qty):
         self.reference_exchange = reference_exchange
         self.target_exchange = target_exchange
@@ -86,8 +50,8 @@ class BackstopMarketMaker:
         self.interval = interval
         self.latest_price = None
         self.latest_price_time = None  # Timestamp for the latest price
-        self.ws = None # web socket
-        self.stop_event = threading.Event() # Event to indicate when the process is terminated
+        self.ws = None
+        self.stop_event = threading.Event()
         self.connection_ready = threading.Event()  # Event to indicate WebSocket connection is ready
 
         self.buy_qty = buy_qty
@@ -107,9 +71,6 @@ class BackstopMarketMaker:
         signal.signal(signal.SIGTERM, self.signal_handler)
 
     def fetch_reference_price(self):
-        """
-        Fetches the reference price from the WebSocket stream.
-        """
         def on_message(ws, message):
             data = json.loads(message)
             self.latest_price = float(data['c'])  # 'c' is the current price in the ticker stream
@@ -144,13 +105,6 @@ class BackstopMarketMaker:
                 time.sleep(5)  # Reconnect after a short delay
 
     def signal_handler(self, signum, frame):
-        """
-        Handles termination signals for graceful shutdown.
-
-        Args:
-            signum (int): The signal number.
-            frame (frame object): The current stack frame.
-        """
         logger.info("Signal received, closing WebSocket connection...")
         if self.ws:
             self.ws.close()
@@ -158,18 +112,6 @@ class BackstopMarketMaker:
         sys.exit(0)
 
     async def send_request(self, session, verb, endpoint, data=None):
-        """
-        Sends an authenticated HTTP request to the BitMEX API.
-
-        Args:
-            session (aiohttp.ClientSession): The HTTP session.
-            verb (str): The HTTP method (GET, POST, etc.).
-            endpoint (str): The API endpoint.
-            data (dict, optional): The request payload.
-
-        Returns:
-            dict: The response from the API.
-        """
         url = self.base_url + endpoint
         expires = int(round(time.time()) + 5)
         data_str = json.dumps(data, separators=(',', ':')) if data else ''
@@ -191,9 +133,6 @@ class BackstopMarketMaker:
             return json.loads(response_text)
 
     async def run(self):
-        """
-        Runs the market making cycle: fetch reference price, calculate target prices, and place/cancel orders.
-        """
         async with aiohttp.ClientSession() as session:
             self.connection_ready.wait()  # Wait for WebSocket connection to be ready
             while not self.stop_event.is_set():
@@ -206,7 +145,8 @@ class BackstopMarketMaker:
                         await asyncio.sleep(0.3)
                         continue
                     
-                    # ref_elapsed = time.time() - ref_start
+                    reference_price = self.latest_price
+                    ref_elapsed = time.time() - ref_start
                     price_age = (time.time() - self.latest_price_time.timestamp()) # how much old is the last fetched price
                     logger.info(f"Reference price: {self.latest_price:.2f}, Age: {price_age:.3f}s")
                     
@@ -236,31 +176,12 @@ class BackstopMarketMaker:
                 await asyncio.sleep(self.interval)
 
     def calculate_target_prices(self, reference_price):
-        """
-        Calculates the buy and sell prices based on the reference price and cost percentages.
-
-        Args:
-            reference_price (float): The current reference price.
-
-        Returns:
-            tuple: The calculated buy price and sell price.
-        """
         tick_size = 0.5
         buy_price = round(reference_price * (1 - self.buy_cost) / tick_size) * tick_size
         sell_price = round(reference_price * (1 + self.sell_cost) / tick_size) * tick_size
         return buy_price, sell_price
 
     async def place_buy_order(self, session, buy_price):
-        """
-        Places a buy order on the target exchange.
-
-        Args:
-            session (aiohttp.ClientSession): The HTTP session.
-            buy_price (float): The buy price.
-
-        Returns:
-            str: The ID of the placed buy order.
-        """
         response = await self.send_request(
             session,
             "POST",
@@ -276,16 +197,6 @@ class BackstopMarketMaker:
         return response['orderID']
 
     async def place_sell_order(self, session, sell_price):
-        """
-        Places a sell order on the target exchange.
-
-        Args:
-            session (aiohttp.ClientSession): The HTTP session.
-            sell_price (float): The sell price.
-
-        Returns:
-            str: The ID of the placed sell order.
-        """
         response = await self.send_request(
             session,
             "POST",
@@ -301,34 +212,22 @@ class BackstopMarketMaker:
         return response['orderID']
 
     async def cancel_existing_orders(self, session):
-        """
-        Cancels all existing orders on the target exchange.
-
-        Args:
-            session (aiohttp.ClientSession): The HTTP session.
-
-        Returns:
-            list: A list of IDs of the cancelled orders.
-        """
         response = await self.send_request(session, "DELETE", "/order/all")
         return [order['orderID'] for order in response]
 
 if __name__ == "__main__":
-    # Configuration for the market maker
     reference_exchange = "binance"
     target_exchange = "bitmex_testnet"
     symbol = "XBTUSDT"
     buy_cost = 0.0050
     sell_cost = 0.0075
-    buy_qty = 1000 # 1000 minimum for BTCUSDT
-    sell_qty = 1000 # 1000 minimum for BTCUSDT
-    interval = 60 # seconds
+    buy_qty = 1000
+    sell_qty = 1000
+    interval = 10
 
-    # API keys for BitMEX
-    bitmex_api_key = KEYS.API_ID # replace with your own keys in str format
-    bitmex_api_secret = KEYS.API_SECRET # Ideally, dotenv Python library is used for handling secrets
+    bitmex_api_key = os.environ["BITMEX_API_KEY"]
+    bitmex_api_secret = os.environ["BITMEX_API_SECRET"]
 
-    # Initialize and run the market maker
     market_maker = BackstopMarketMaker(
         reference_exchange=reference_exchange,
         target_exchange=target_exchange,

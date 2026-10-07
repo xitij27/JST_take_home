@@ -1,90 +1,163 @@
-# Backstop Market Making Strategy
-## Prerequisites 
-### Conda Setup
-Conda offers a very convenient way to manage different Python versions and environments. More instructions for installing the same can be found [here](https://docs.conda.io/projects/conda/en/latest/user-guide/install/index.html)  
+# Backstop Market Maker
 
-The conda version used for this project is **23.7.4**  
+A low-latency backstop market maker. It streams the BTC/USDT reference price from **Binance** over a WebSocket and keeps a buy and a sell limit order quoted around that price on the **BitMEX testnet**.
 
-### Environment Setup
-- **Python version**: 3.11.3  
+- **Cached reference price.** A dedicated WebSocket thread keeps the latest price and its timestamp in memory, so the main loop never makes a request for it.
+- **Concurrent order management.** Cancel, buy and sell requests go out together with `asyncio.gather` over a shared `aiohttp` session.
+- **Hand-rolled request signing.** HMAC-SHA256 authentication is implemented directly against the BitMEX REST API, without the official client.
+- **Fast cycles.** A full cycle takes **~200–500 ms** in steady state, against ~2 s for a single-threaded synchronous implementation.
 
-The necessary packages have been listed in `jstenv.yml` file. To set up a new Python environment with the packages mentioned in `jstenv.yml`, the following command can be used in the directory containing this file:
-```
-$ conda env create -f jstenv.yml
-```
-This should create a new environment called `jstenv`.
+## Architecture
 
-## Running script.py
-The Python environment we've created first needs to be activated using:
-```
-$ conda activate jstenv
-```
-To further verify if the correct environment is active, type `$ conda info --envs` into the terminal.  
-Ensure that the terminal is in the directory containing `script.py`.
-Now we can proceed with running the script as shown below:
-```
-$ python script.py
+```mermaid
+flowchart LR
+    binance["Binance WebSocket<br/>btcusdt@ticker"] -- "price every ~1 s" --> ws["WS-Thread<br/>latest price + timestamp"]
+    ws -- "shared state" --> main["MainThread (asyncio)<br/>freshness check → quote calculation"]
+    main -- "asyncio.gather" --> cancel["DELETE /order<br/>(previous cycle's orders)"]
+    main -- "asyncio.gather" --> buy["POST /order (Buy)"]
+    main -- "asyncio.gather" --> sell["POST /order (Sell)"]
+    cancel & buy & sell --> bitmex[("BitMEX testnet")]
 ```
 
-## Terminating the script
-The code will continue running until `Ctrl`+`C` is pressed in the terminal.
+The design was inspired by [this talk](https://www.youtube.com/watch?v=xKRRquqQkAo). One of its slides suggested taking the reference price from a WebSocket:
 
-## Current Approach
-### Inspiration  
-The current approach is inspired by this [YouTube video](https://www.youtube.com/watch?v=xKRRquqQkAo). The architecture and idea of using web socket for fetching reference prize was obtained through one of the slides shared in the video. A screenshot has also been provided with the name: `example_architecture.png`.
+<img src="docs/images/example_architecture.png" alt="Reference architecture slide" width="600">
 
-![Example Architecture](example_architecture.png)
+## Project structure
 
-### Overview
-This project implements a backstop market maker that periodically fetches the reference price from a Binance WebSocket and places buy and sell orders on the BitMEX exchange based on predefined costs and quantities.
-
-### 1. Fetching Reference Price
-[Binance web socket documentation](https://developers.binance.com/docs/binance-spot-api-docs/web-socket-streams) provides updates every ~1000ms. By saving the latest price received from the WebSocket and using it within a certain time frame (e.g., 600ms), we can avoid the delay typically caused by waiting for the latest value.
-
-To achieve this, we record values received from the WebSocket in a separate thread called `WS-Thread`. This thread keeps the reference price updated regularly, allowing the `MainThread` to use the most recent price for calculating buy and sell prices. Consequently, the latency caused by fetching the reference price is reduced to zero.
-
-We also save the time at which the latest price was recorded and if the difference between recording time and current time exceeds 600ms, we have a mechanism in place to wait for 300ms and then recheck the validity of latest recorded price.
-
-### 2. Calculation of Target Prices
-The target prices are calculated using the following formula:
 ```
+.
+├── market_maker.py     # The strategy
+├── requirements.txt    # pip dependencies
+├── environment.yml     # Conda environment (Python 3.11)
+├── docs/images/        # Reference architecture and run screenshots
+└── experiments/        # Earlier iterations, kept for reference (see experiments/README.md)
+```
+
+## Getting started
+
+### Prerequisites
+
+- Python 3.11 or newer (developed on 3.11.3)
+- A [BitMEX testnet](https://testnet.bitmex.com) account and an API key with order permissions
+
+### Install
+
+With pip:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+Or with conda:
+
+```bash
+conda env create -f environment.yml
+conda activate jstenv
+```
+
+### Set your API credentials
+
+The script reads BitMEX credentials from environment variables, so they never live in the code:
+
+```bash
+# macOS / Linux
+export BITMEX_API_KEY="your-key-id"
+export BITMEX_API_SECRET="your-secret"
+```
+
+```bat
+:: Windows (cmd)
+set BITMEX_API_KEY=your-key-id
+set BITMEX_API_SECRET=your-secret
+```
+
+### Run
+
+```bash
+python market_maker.py
+```
+
+The bot runs until you press <kbd>Ctrl</kbd>+<kbd>C</kbd>. That closes the WebSocket connection and exits cleanly.
+
+### Configuration
+
+Strategy parameters are set in the `__main__` block of [`market_maker.py`](market_maker.py):
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `symbol` | `XBTUSDT` | BitMEX instrument to quote |
+| `buy_cost` | `0.0050` | Bid placed 50 bps below the reference price |
+| `sell_cost` | `0.0075` | Ask placed 75 bps above the reference price |
+| `buy_qty` / `sell_qty` | `1000` | Order size in contracts (1000 = 0.001 BTC, the minimum for XBTUSDT) |
+| `interval` | `60` | Seconds between cycles |
+
+## How it works
+
+### 1. Fetching the reference price
+
+The [Binance ticker stream](https://developers.binance.com/docs/binance-spot-api-docs/web-socket-streams) pushes an update roughly every 1000 ms. Waiting for the next update would add that delay to every cycle. Instead, the latest price is cached and reused for up to 600 ms.
+
+A separate thread, `WS-Thread`, receives the WebSocket messages and keeps the reference price and the time it arrived up to date. `MainThread` reads the cached value directly, so when that value is fresh, getting the reference price adds effectively no latency to a cycle.
+
+If the cached price is older than 600 ms, the main loop waits 300 ms and checks again before quoting. This keeps orders from being placed off a stale price. Because the ticker stream only updates once per second, this wait does happen in practice (see [Future work](#future-work)).
+
+### 2. Calculating target prices
+
+```python
 tick_size = 0.5
 buy_price = round(reference_price * (1 - self.buy_cost) / tick_size) * tick_size
 sell_price = round(reference_price * (1 + self.sell_cost) / tick_size) * tick_size
 ```
-The `tick_size` is smallest possible price increment for the trading instrument. It ensures that the prices are rounded to a multiple of this increment, i.e., 0.00 or 0.50.
 
-Such basic arithmetic operations don't cause much latency and it's been almost always observed to give a reading of 0.000s for latency.
+`tick_size` is the smallest price increment the instrument allows. Rounding to it keeps every price on a valid `.00` or `.50` level. The calculation is cheap enough that its latency almost always measures 0.000 s.
 
-### 3. Cancellation and Placement of Orders
+### 3. Cancelling and placing orders
 
-Cancellation and placement of orders are executed via BitMEX REST APIs, as detailed in the [documentation](https://testnet.bitmex.com/api/explorer/). Each REST API request is implemented through the `send_request` function, which manages the type (cancel, buy, sell) and handles the response.
+Orders are managed through the [BitMEX REST API](https://testnet.bitmex.com/api/explorer/). Every call goes through `send_request`, which signs the request and handles the response.
 
-#### **asyncio.gather**
+`asyncio.gather` runs these three requests concurrently and waits for all of them to finish:
 
-`asyncio.gather` is a method provided by Python's `asyncio` module that allows multiple asynchronous functions to run concurrently and waits for all of them to complete. It takes multiple coroutine objects (functions defined with `async` and using `await` inside) as arguments and returns their results as a tuple. In our implementation, `asyncio.gather` handles the following tasks concurrently:
+- cancel the orders placed in the previous cycle, by ID (`DELETE /order`)
+- place the new buy order (`POST /order`)
+- place the new sell order (`POST /order`)
 
-- Cancellation of existing orders
-- Placement of new buy orders
-- Placement of new sell orders
+The bot keeps the IDs of its own resting orders and cancels only those. A blanket `DELETE /order/all` sent at the same moment could reach the exchange after the new orders and cancel them too (see [Bug fix: cancel/place race](#bug-fix-cancelplace-race)). Leftover orders from an earlier run are cleared once with `DELETE /order/all` at startup, before quoting begins.
 
-This approach ensures that these tasks are executed efficiently, reducing the overall cycle time.
+Each request's failure is handled separately. Any order that was successfully placed is tracked, and a failed cancel is retried in the next cycle, so no order is left resting on the book untracked.
 
-#### Performance
+This network round trip is now the only significant cost in a cycle.
 
-Under stable and running conditions, the time taken to complete these tasks ranges between 200-500ms. However, during the initial run of the script, the first few cycles may show unstable results, for example, latencies as high as 1.5 seconds and then 800ms. After these initial cycles, the process gradually stabilizes to the 200-500ms range.
+### 4. Performance
 
-This step, involving the cancellation and placement of orders, is the most time-consuming part of our cycle.
+| Approach | Time per cycle |
+|---|---|
+| Single thread, synchronous HTTP for everything ([`experiments/script3.py`](experiments/script3.py)) | ~1.8–2.5 s |
+| WebSocket price thread + concurrent async REST (`market_maker.py`) | **~200–500 ms** in steady state |
 
-### 4. Completion of Cycle
-On the overall, we have managed to optimise step 1 and 3 which would've otherwise taken a lot of time if done synchronously on the same thread.  
+The first few cycles after startup are slower, for example 1.5 s and then 800 ms. After that the cycle time settles into the 200–500 ms range.
 
-In stable and running conditions, the cycle typically completes in 200-500ms. However, when running the script for the first time, the initial cycles exhibit unstable results, with latencies as high as 1.5 seconds. After these initial cycles, the timings stabilize within the expected range of 200-500ms.
+These times are measured from the moment a fresh reference price is available. They leave out any time spent waiting for one (see [Future work](#future-work)).
 
-### Sample Terminal Output for 5 Cycles
-To get this output, the interval was set to 10 seconds, i.e., we are trying to run the cycle every 10 seconds. 
+## Results
+
+> **Note:** these logs and screenshots were recorded before the [cancel/place race](#bug-fix-cancelplace-race) was fixed. Timings are unaffected, but some new order IDs show up in the "Orders cancelled" list.
+
+Cycle log from a fresh start (first cycle, still warming up) and from steady state:
+
+<img src="docs/images/logs2.png" alt="First cycle after startup" width="800">
+<img src="docs/images/logs1.png" alt="Steady-state cycle" width="800">
+
+The resulting orders in the BitMEX testnet order history:
+
+<img src="docs/images/bitmex_ui2.png" alt="BitMEX testnet order history" width="800">
+
+<details>
+<summary>Full terminal output for 5 cycles (interval set to 10 s)</summary>
+
 ```
-(jstenv) C:\Users\kp27d\Downloads\projects\JST_take_home>python script.py
 2024-07-09 23:08:26,565 [INFO] [WS-Thread] Websocket connected
 2024-07-09 23:08:26,566 [INFO] [WS-Thread] WebSocket connection opened
 2024-07-09 23:08:26,566 [INFO] [MainThread] Waiting for price update...
@@ -176,11 +249,14 @@ To get this output, the interval was set to 10 seconds, i.e., we are trying to r
 2024-07-09 23:09:12,186 [INFO] [MainThread] CYCLE COMPLETED. Total time: 0.2362 seconds
 ```
 
-## Extra Details
-### First Approach: 
-**Single thread, Synchronous Execution, All requests are HTTP**  
-This example has been provided to compare the current approach with the most basic approach.
-This took roughly 1.8-2.5 seconds for completion of one cycle. The latency isn't impressive!
+</details>
+
+## Development history
+
+### Baseline: single thread, synchronous, all HTTP
+
+The first version ([`experiments/script3.py`](experiments/script3.py)) did every step in sequence over plain HTTP. One cycle took roughly 1.8–2.5 s:
+
 ```
 --- Starting new cycle ---
 1. Getting reference price...
@@ -198,33 +274,36 @@ This took roughly 1.8-2.5 seconds for completion of one cycle. The latency isn't
    Sell order result: cb993f70-acfc-4483-b7e8-c1048c45135d
    Latency for placing new orders: 1.3075 seconds
 5. Cycle completed. Total time: 2.0401 seconds
-Waiting for 60 seconds before next cycle...
 ```
-### Brief Overview of Other Attempts
-- Tried `bitmex` Python client [(Github repo)](https://github.com/BitMEX/api-connectors/tree/master/official-http/python-swaggerpy)  
-Negligible improvement in latency but it can help avoid generation of signature for the BitMEX API. 
-- Tried to place orders with [BitMEX REST APIs](https://testnet.bitmex.com/api/explorer/)  
-Initially had trouble generating a valid signature which was probably caused by byte to utf-8 conversions but that got fixed with a few changes. Realised that [BitMEX Github code](https://github.com/BitMEX/api-connectors/blob/master/official-http/python-swaggerpy/BitMEXAPIKeyAuthenticator.py) might not work smoothly. Once this was working, I was able to focus on Multithreading to get that latest price without waiting for 600-800ms.
 
+### Other approaches tried
 
-## Possible Improvements  
-### Time taken for Cancellation and Placement of Orders  
-By far, this is the only step now which significantly affects the overall time to complete one cycle. If possible, I'd like to seek guidance and explore other ways with which we can decrease the latency introduced by this step, i.e., REST API response time.
+- **The official [`bitmex` Python client](https://github.com/BitMEX/api-connectors/tree/master/official-http/python-swaggerpy).** It made a negligible difference to latency. Its main benefit is that it handles request signing for you.
+- **Raw [BitMEX REST API](https://testnet.bitmex.com/api/explorer/) calls.** Generating a valid signature was tricky at first, probably because of bytes-to-UTF-8 conversions. The [BitMEX reference authenticator](https://github.com/BitMEX/api-connectors/blob/master/official-http/python-swaggerpy/BitMEXAPIKeyAuthenticator.py) didn't work out of the box. Once signing worked, the focus moved to multithreading so the loop could use the latest price without waiting 600–800 ms.
 
-### Separation of Concerns
-The code could've been split into smaller, more manageable modules. For example, new classes for each exchange, web socket handling, etc., could've been implemented. I didn't want to redesign the entire code after coming this far. But since this was my first attempt at making a trading bot, I'm sure I'll have a better idea on how to start next time.
+### Bug fix: cancel/place race
 
-### Calculation of Prices
-The calculations performed in the code are currently simple and thus have negligible latency. However, for more complex computations, it is important to explore optimization techniques to minimize latency.
+The first concurrent version sent `DELETE /order/all` in the same `asyncio.gather` as the two new orders. Nothing guarantees the exchange processes the cancel first. When a new order arrived before the cancel, the cancel removed it as well. In the 5-cycle log above, 4 of the 5 cycles cancel at least one of their own new orders. In the first cycle, both new orders are cancelled immediately, which leaves nothing quoted.
 
-### More Configurable Variables & Coding Conventions
-The code could've been made more configurable by allowing the user to specify the exchange, the symbol, API for fetching reference price, etc. While C++ has access specifiers like public, private and protected, Python does not. Therefore, in Python we use naming conventions to denote the intended access levels as shown below:
-- **Public:** No underscore prefix. Example: self.symbol
-- **Protected:** Single underscore prefix. Example: self._ws
-- **Private:** Double underscore prefix. Example: self.__api_key
+The fix cancels only the previous cycle's orders by ID, so the requests stay concurrent and the cycle time doesn't change. It was checked by running the real `run()` loop against a simulated exchange with random per-request latency:
 
-### Unit Testing and Integration Testing
-Unit tests could've been written to cover various parts of the code like API interactions and WebSocket handling. Integration testing could've helped determine whether all the components work together as expected.
+| Version | Cycles ending with exactly one bid and one ask |
+|---|---|
+| Cancel all orders concurrently | 103 / 300 |
+| Cancel previous cycle's orders by ID | 300 / 300 |
 
+With 15–40% of requests failing at random, the tracked order IDs still matched the orders on the book after every cycle.
 
+Every intermediate version, including a C++ port, is in [`experiments/`](experiments/) with a short description of each.
 
+## Future work
+
+- **Real-time reference price.** The Binance `@ticker` stream only updates once per second, so the cached price is often older than the 600 ms freshness limit and the loop waits up to ~0.6 s for the next update. In the sample log, 2 of the 4 steady-state cycles had to wait. The cycle timer restarts after each wait, so the reported times leave it out: cycles 2 and 5 are reported as 0.90 s and 0.24 s but really took ~1.5 s and ~0.86 s. Switching to the real-time `@bookTicker` stream would remove the wait, and its best bid and ask give a mid price, which is a better reference than the last trade.
+- **Pull quotes when something goes wrong.** Any WebSocket error or close currently stops the bot, so the reconnect loop never actually runs, and Binance drops every connection after 24 hours. When the bot exits, including on <kbd>Ctrl</kbd>+<kbd>C</kbd>, its last quotes stay on the book at stale prices. It should reconnect automatically, cancel its orders on shutdown, and arm BitMEX's `cancelAllAfter` dead-man's switch so the exchange pulls the quotes if the process dies.
+- **Re-quote on price moves, not only on a timer.** With a 60 s interval, quotes can sit unchanged for a minute while the reference price moves. What matters most is how quickly quotes follow the reference, not how long a single cycle takes. Re-quoting whenever the reference moves by more than a set number of bps, with the interval as a fallback, would close that gap.
+- **Position and risk management.** The bot doesn't track fills, inventory or exposure limits, and doesn't hedge on the reference exchange. A backstop market maker gets filled exactly when prices dislocate, so it needs position limits and hedging before it could run unattended.
+- **Order round-trip latency.** Cancelling and placing orders is now the only step that significantly affects cycle time. Options include amending resting orders in place (`PUT /order`) instead of cancelling and re-placing them, and running closer to the exchange.
+- **Separation of concerns.** Splitting the code into smaller modules would make it easier to extend, for example a class per exchange and a separate WebSocket price feed.
+- **Configuration.** Exchange, symbol, reference feed and strategy parameters could come from CLI arguments or a config file instead of the `__main__` block.
+- **Heavier pricing logic.** The current price calculation is trivial. A more complex model would need its own latency budget and optimisation.
+- **Testing.** Add unit tests for request signing, price calculation and WebSocket handling, and integration tests against the testnet.

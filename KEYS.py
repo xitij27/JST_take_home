@@ -1,2 +1,0 @@
-API_ID = 'isZdN8ybNIMSinAk9WztI-Fr'
-API_SECRET = 'Aeyzah7-8ML26kXxDGEHmCGfPey_z66alSnz8PiAJwV1zDzP'

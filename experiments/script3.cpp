@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include <iostream>
 #include <string>
 #include <chrono>
@@ -170,8 +171,8 @@ private:
 };
 
 int main() {
-    string api_key = "isZdN8ybNIMSinAk9WztI-Fr";
-    string api_secret = "Aeyzah7-8ML26kXxDGEHmCGfPey_z66alSnz8PiAJwV1zDzP";
+    string api_key = getenv("BITMEX_API_KEY");
+    string api_secret = getenv("BITMEX_API_SECRET");
     string symbol = "XBTUSD";
     double buy_cost = 0.0050;
     double sell_cost = 0.0075;
